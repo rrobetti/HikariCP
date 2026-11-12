@@ -61,6 +61,7 @@ public class HikariConfig implements HikariConfigMXBean
    //
    private volatile String catalog;
    private volatile long connectionTimeout;
+   private volatile long connectionCreationWaitTimeout;
    private volatile long validationTimeout;
    private volatile long idleTimeout;
    private volatile long leakDetectionThreshold;
@@ -197,6 +198,23 @@ public class HikariConfig implements HikariConfigMXBean
       else {
          this.connectionTimeout = connectionTimeoutMs;
       }
+   }
+
+   /** {@inheritDoc} */
+   @Override
+   public long getConnectionCreationWaitTimeout()
+   {
+      return connectionCreationWaitTimeout;
+   }
+
+   /** {@inheritDoc} */
+   @Override
+   public void setConnectionCreationWaitTimeout(long connectionCreationWaitTimeoutMs)
+   {
+      if (connectionCreationWaitTimeoutMs < 0) {
+         throw new IllegalArgumentException("connectionCreationWaitTimeout cannot be negative");
+      }
+      this.connectionCreationWaitTimeout = connectionCreationWaitTimeoutMs;
    }
 
    /** {@inheritDoc} */

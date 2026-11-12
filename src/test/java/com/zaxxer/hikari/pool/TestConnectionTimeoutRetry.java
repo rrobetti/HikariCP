@@ -24,8 +24,10 @@ import static com.zaxxer.hikari.util.ClockSource.currentTime;
 import static com.zaxxer.hikari.util.ClockSource.elapsedMillis;
 import static java.lang.Thread.sleep;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertSame;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -33,9 +35,14 @@ import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.sql.SQLTransientConnectionException;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeoutException;
 
 import org.apache.logging.log4j.Level;
 import org.junit.After;
@@ -49,6 +56,238 @@ import com.zaxxer.hikari.mocks.StubDataSource;
 
 public class TestConnectionTimeoutRetry
 {
+   @Test
+   public void testCreationGraceAllowsSlowCreation() throws Exception
+   {
+      GateDataSource source = new GateDataSource();
+      var executor = Executors.newSingleThreadExecutor();
+      try (HikariDataSource ds = new HikariDataSource(creationWaitConfig(source, 0))) {
+         try {
+            ds.getHikariConfigMXBean().setConnectionCreationWaitTimeout(Long.MAX_VALUE);
+            var acquisition = executor.submit(() -> ds.getConnection());
+            assertTrue("Creation did not start", source.creationStarted.await(2, TimeUnit.SECONDS));
+            assertThrows(TimeoutException.class, () -> acquisition.get(500, MILLISECONDS));
+            source.creationAllowed.countDown();
+            try (Connection connection = acquisition.get(2, TimeUnit.SECONDS)) {
+               assertNotNull(connection);
+               long start = currentTime();
+               assertThrows(SQLTransientConnectionException.class, () -> ds.getConnection());
+               assertTrue("Saturated pool received creation grace", elapsedMillis(start) < 1500);
+            }
+         }
+         finally {
+            source.creationAllowed.countDown();
+            executor.shutdownNow();
+         }
+      }
+   }
+
+   @Test
+   public void testSpareCapacityWithoutCreationDoesNotReceiveGrace() throws Exception
+   {
+      GateDataSource source = new GateDataSource();
+      CountDownLatch adderStarted = new CountDownLatch(1);
+      CountDownLatch adderAllowed = new CountDownLatch(1);
+      try (HikariDataSource ds = new HikariDataSource(creationWaitConfig(source, 5000))) {
+         var field = HikariPool.class.getDeclaredField("addConnectionExecutor");
+         field.setAccessible(true);
+         var adder = (ThreadPoolExecutor) field.get(getPool(ds));
+         var blocker = adder.submit(() -> {
+            adderStarted.countDown();
+            return adderAllowed.await(10, TimeUnit.SECONDS);
+         });
+         try {
+            assertTrue("Adder did not start", adderStarted.await(2, TimeUnit.SECONDS));
+            long start = currentTime();
+            assertThrows(SQLTransientConnectionException.class, () -> ds.getConnection());
+            assertTrue("Queued creation received grace", elapsedMillis(start) < 1500);
+            assertEquals("No physical creation should have started", 1L, source.creationStarted.getCount());
+         }
+         finally {
+            adderAllowed.countDown();
+            source.creationAllowed.countDown();
+            assertTrue("Adder was not released", blocker.get(2, TimeUnit.SECONDS));
+         }
+      }
+   }
+
+   @Test
+   public void testCreationGraceDisabledByDefault() throws Exception
+   {
+      GateDataSource source = new GateDataSource();
+      try (HikariDataSource ds = new HikariDataSource(creationWaitConfig(source, 0))) {
+         try {
+            long start = currentTime();
+            assertThrows(SQLTransientConnectionException.class, () -> ds.getConnection());
+            assertTrue("Acquisition returned before its deadline", elapsedMillis(start) >= 250);
+            assertTrue("Default timeout was extended", elapsedMillis(start) < 1500);
+         }
+         finally {
+            source.creationAllowed.countDown();
+         }
+      }
+   }
+
+   @Test
+   public void testCreationGraceDoesNotExtendExplicitTimeout() throws Exception
+   {
+      GateDataSource source = new GateDataSource();
+      try (HikariDataSource ds = new HikariDataSource(creationWaitConfig(source, 5000))) {
+         try {
+            long start = currentTime();
+            assertThrows(SQLTransientConnectionException.class, () -> getPool(ds).getConnection(250));
+            assertTrue("Explicit deadline was extended", elapsedMillis(start) < 1500);
+         }
+         finally {
+            source.creationAllowed.countDown();
+         }
+      }
+   }
+
+   @Test
+   public void testCreationGraceIsBoundedAcrossFailedRetries() throws Exception
+   {
+      GateDataSource source = new GateDataSource();
+      source.creationFailure = new SQLException("Connection refused");
+      var executor = Executors.newSingleThreadExecutor();
+      try (HikariDataSource ds = new HikariDataSource(creationWaitConfig(source, 1000))) {
+         try {
+            long start = currentTime();
+            var acquisition = executor.submit(() -> ds.getConnection());
+            assertTrue("Creation did not start", source.creationStarted.await(2, TimeUnit.SECONDS));
+            assertThrows(TimeoutException.class, () -> acquisition.get(500, MILLISECONDS));
+            source.creationAllowed.countDown();
+            var failure = assertThrows(ExecutionException.class, () -> acquisition.get(2, TimeUnit.SECONDS));
+            assertTrue(failure.getCause() instanceof SQLTransientConnectionException);
+            assertTrue("Acquisition returned before the combined deadline", elapsedMillis(start) >= 1250);
+            assertTrue("Retries renewed the grace period", elapsedMillis(start) < 2500);
+         }
+         finally {
+            source.creationAllowed.countDown();
+            executor.shutdownNow();
+         }
+      }
+   }
+
+   @Test
+   public void testCreationGraceIsBoundedForBlockedCreation() throws Exception
+   {
+      GateDataSource source = new GateDataSource();
+      var executor = Executors.newSingleThreadExecutor();
+      try (HikariDataSource ds = new HikariDataSource(creationWaitConfig(source, 1000))) {
+         try {
+            long start = currentTime();
+            var acquisition = executor.submit(() -> ds.getConnection());
+            assertTrue("Creation did not start", source.creationStarted.await(2, TimeUnit.SECONDS));
+            var failure = assertThrows(ExecutionException.class, () -> acquisition.get(2500, MILLISECONDS));
+            assertTrue(failure.getCause() instanceof SQLTransientConnectionException);
+            assertTrue("Creation did not receive grace", elapsedMillis(start) >= 1250);
+            assertTrue("Creation wait exceeded its combined budget", elapsedMillis(start) < 2500);
+         }
+         finally {
+            source.creationAllowed.countDown();
+            executor.shutdownNow();
+         }
+      }
+   }
+
+   @Test
+   public void testCreationGraceCanBeInterrupted() throws Exception
+   {
+      GateDataSource source = new GateDataSource();
+      var executor = Executors.newSingleThreadExecutor();
+      try (HikariDataSource ds = new HikariDataSource(creationWaitConfig(source, 5000))) {
+         try {
+            var acquisition = executor.submit(() -> {
+               try (Connection connection = ds.getConnection()) {
+                  return false;
+               }
+               catch (SQLException e) {
+                  return Thread.currentThread().isInterrupted() && e.getMessage().contains("Interrupted during connection acquisition");
+               }
+            });
+            assertTrue("Creation did not start", source.creationStarted.await(2, TimeUnit.SECONDS));
+            assertThrows(TimeoutException.class, () -> acquisition.get(500, MILLISECONDS));
+            executor.shutdownNow();
+            assertTrue("Acquisition did not preserve interruption", acquisition.get(1, TimeUnit.SECONDS));
+         }
+         finally {
+            source.creationAllowed.countDown();
+            executor.shutdownNow();
+         }
+      }
+   }
+
+   @Test
+   public void testCreationGraceDoesNotRequireNewConnection() throws Exception
+   {
+      GateDataSource source = new GateDataSource();
+      var executor = Executors.newSingleThreadExecutor();
+      HikariConfig config = creationWaitConfig(source, 2000);
+      config.setMaximumPoolSize(2);
+      try (HikariDataSource ds = new HikariDataSource(config)) {
+         source.creationAllowed.countDown();
+         Connection first = ds.getConnection();
+         try {
+            source.creationAllowed = new CountDownLatch(1);
+            source.creationStarted = new CountDownLatch(1);
+            var acquisition = executor.submit(() -> ds.getConnection());
+            assertTrue("Creation did not start", source.creationStarted.await(2, TimeUnit.SECONDS));
+            assertThrows(TimeoutException.class, () -> acquisition.get(500, MILLISECONDS));
+            first.close();
+            try (Connection returned = acquisition.get(1, TimeUnit.SECONDS)) {
+               assertNotNull(returned);
+               assertEquals("A new connection should still be blocked", 1, getPool(ds).getTotalConnections());
+            }
+         }
+         finally {
+            first.close();
+            source.creationAllowed.countDown();
+            executor.shutdownNow();
+         }
+      }
+   }
+
+   private HikariConfig creationWaitConfig(GateDataSource source, long creationWait)
+   {
+      HikariConfig config = newHikariConfig();
+      config.setDataSource(source);
+      config.setMinimumIdle(0);
+      config.setMaximumPoolSize(1);
+      config.setInitializationFailTimeout(-1);
+      config.setConnectionTimeout(250);
+      if (creationWait > 0) {
+         config.setConnectionCreationWaitTimeout(creationWait);
+      }
+      return config;
+   }
+
+   private static class GateDataSource extends StubDataSource
+   {
+      volatile CountDownLatch creationStarted = new CountDownLatch(1);
+      volatile CountDownLatch creationAllowed = new CountDownLatch(1);
+      volatile SQLException creationFailure;
+
+      @Override
+      public Connection getConnection() throws SQLException
+      {
+         creationStarted.countDown();
+         try {
+            if (!creationAllowed.await(10, TimeUnit.SECONDS)) {
+               throw new SQLException("Test did not release connection creation");
+            }
+         }
+         catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new SQLException("Connection creation interrupted", e);
+         }
+         if (creationFailure != null) {
+            throw creationFailure;
+         }
+         return super.getConnection();
+      }
+   }
+
    @Test
    public void testConnectionRetries() throws SQLException
    {
