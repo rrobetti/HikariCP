@@ -124,6 +124,19 @@ public class TestValidation
    }
 
    @Test
+   public void validateInvalidConnectionCreationWaitTimeout()
+   {
+      try {
+         HikariConfig config = newHikariConfig();
+         config.setConnectionCreationWaitTimeout(-1L);
+         fail("negative connection creation wait timeout accepted");
+      }
+      catch (IllegalArgumentException ise) {
+         assertTrue(ise.getMessage().contains("connectionCreationWaitTimeout cannot be negative"));
+      }
+   }
+
+   @Test
    public void validateInvalidValidationTimeout()
    {
       try {

@@ -190,8 +190,24 @@ It is a boolean value.
 &#9203;``connectionTimeout``<br/>
 This property controls the maximum number of milliseconds that a client (that's you) will wait
 for a connection from the pool.  If this time is exceeded without a connection becoming
-available, a SQLException will be thrown.  Lowest acceptable connection timeout is 250 ms.
+available, a SQLException will be thrown, unless the optional ``connectionCreationWaitTimeout``
+applies. Lowest acceptable connection timeout is 250 ms.
 *Default: 30000 (30 seconds)*
+
+&#9203;``connectionCreationWaitTimeout``<br/>
+This property allows additional acquisition waiting time, in milliseconds, when ``connectionTimeout``
+expires while a background connection creation attempt is in progress and the pool is below
+``maximumPoolSize``. For example, ``connectionTimeout=250`` and ``connectionCreationWaitTimeout=5000``
+allow up to 5250 ms of acquisition waiting in that case, while an exhausted pool retains the normal
+250 ms timeout. The extra budget is granted at most once, measured from the original acquisition
+start; retries do not reset it. Once granted, the budget remains available even if creation finishes
+or fails. Any available connection can satisfy the request; this does not reserve a new connection
+for a particular caller. Spare capacity alone, queued creation work, or retry backoff do not qualify.
+This setting does not change JDBC login/connect timeouts, cancel connection creation, or change
+the 250 ms minimum for ``connectionTimeout``. It applies to acquisitions after pool initialization;
+``initializationFailTimeout`` continues to govern startup.
+A value of 0 disables the extra wait and preserves existing behavior. Negative values are not allowed.
+*Default: 0 (disabled)*
 
 &#9203;``idleTimeout``<br/>
 This property controls the maximum amount of time that a connection is allowed to sit idle in the

@@ -33,6 +33,7 @@ import java.sql.SQLException;
 import java.sql.SQLTransientConnectionException;
 import java.util.Optional;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 
 import static com.zaxxer.hikari.util.ClockSource.*;
@@ -69,6 +70,7 @@ public final class HikariPool extends PoolBase implements HikariPoolMXBean, IBag
 
    private final PoolEntryCreator poolEntryCreator = new PoolEntryCreator();
    private final PoolEntryCreator postFillPoolEntryCreator = new PoolEntryCreator("After adding ");
+   private final AtomicInteger connectionsBeingCreated = new AtomicInteger();
    private final ThreadPoolExecutor addConnectionExecutor;
    private final ThreadPoolExecutor closeConnectionExecutor;
 
@@ -132,14 +134,14 @@ public final class HikariPool extends PoolBase implements HikariPoolMXBean, IBag
    }
 
    /**
-    * Get a connection from the pool, or timeout after connectionTimeout milliseconds.
+    * Get a connection from the pool, allowing the configured creation wait after connectionTimeout.
     *
     * @return a java.sql.Connection instance
     * @throws SQLException thrown if a timeout occurs trying to obtain a connection
     */
    public Connection getConnection() throws SQLException
    {
-      return getConnection(connectionTimeout);
+      return getConnection(connectionTimeout, config.getConnectionCreationWaitTimeout());
    }
 
    /**
@@ -151,32 +153,49 @@ public final class HikariPool extends PoolBase implements HikariPoolMXBean, IBag
     */
    public Connection getConnection(final long hardTimeout) throws SQLException
    {
+      return getConnection(hardTimeout, 0L);
+   }
+
+   private Connection getConnection(final long hardTimeout, final long creationWaitTimeout) throws SQLException
+   {
       suspendResumeLock.acquire();
       final var startTime = currentTime();
 
       try {
+         var timeoutBudget = hardTimeout;
+         var extended = false;
          var timeout = hardTimeout;
          do {
             var poolEntry = connectionBag.borrow(timeout, MILLISECONDS);
-            if (poolEntry == null) {
-               break; // We timed out... break and throw exception
+            if (poolEntry != null) {
+               final var now = currentTime();
+               if (poolEntry.isMarkedEvicted() || (elapsedMillis(poolEntry.lastAccessed, now) > aliveBypassWindowMs && isConnectionDead(poolEntry.connection))) {
+                  closeConnection(poolEntry, poolEntry.isMarkedEvicted() ? EVICTED_CONNECTION_MESSAGE : DEAD_CONNECTION_MESSAGE);
+               }
+               else {
+                  metricsTracker.recordBorrowStats(poolEntry, startTime);
+                  if (isRequestBoundariesEnabled) {
+                     try {
+                        poolEntry.connection.beginRequest();
+                     } catch (SQLException e) {
+                        logger.warn("beginRequest Failed for: {}, ({})", poolEntry.connection, e.getMessage());
+                     }
+                  }
+                  return poolEntry.createProxyConnection(leakTaskFactory.schedule(poolEntry));
+               }
             }
 
-            final var now = currentTime();
-            if (poolEntry.isMarkedEvicted() || (elapsedMillis(poolEntry.lastAccessed, now) > aliveBypassWindowMs && isConnectionDead(poolEntry.connection))) {
-               closeConnection(poolEntry, poolEntry.isMarkedEvicted() ? EVICTED_CONNECTION_MESSAGE : DEAD_CONNECTION_MESSAGE);
-               timeout = hardTimeout - elapsedMillis(startTime);
-            }
-            else {
-               metricsTracker.recordBorrowStats(poolEntry, startTime);
-               if (isRequestBoundariesEnabled) {
-                  try {
-                     poolEntry.connection.beginRequest();
-                  } catch (SQLException e) {
-                     logger.warn("beginRequest Failed for: {}, ({})", poolEntry.connection, e.getMessage());
-                  }
+            timeout = timeoutBudget - elapsedMillis(startTime);
+            if (poolEntry == null || timeout <= 0L) {
+               if (!extended && creationWaitTimeout > 0 && poolState == POOL_NORMAL && connectionsBeingCreated.get() > 0
+                   && getTotalConnections() < config.getMaximumPoolSize()) {
+                  extended = true;
+                  timeoutBudget = hardTimeout > Long.MAX_VALUE - creationWaitTimeout ? Long.MAX_VALUE : hardTimeout + creationWaitTimeout;
+                  timeout = timeoutBudget - elapsedMillis(startTime);
                }
-               return poolEntry.createProxyConnection(leakTaskFactory.schedule(poolEntry));
+               else {
+                  break;
+               }
             }
          } while (timeout > 0L);
 
@@ -749,11 +768,20 @@ public final class HikariPool extends PoolBase implements HikariPoolMXBean, IBag
          var added = false;
          try {
             while (shouldContinueCreating()) {
-               final var poolEntry = createPoolEntry();
-               if (poolEntry != null) {
-                  added = true;
-                  connectionBag.add(poolEntry);
-                  logger.debug("{} - Added connection {}", poolName, poolEntry.connection);
+               connectionsBeingCreated.incrementAndGet();
+               try {
+                  final var poolEntry = createPoolEntry();
+                  if (poolEntry != null) {
+                     added = true;
+                     connectionBag.add(poolEntry);
+                     logger.debug("{} - Added connection {}", poolName, poolEntry.connection);
+                  }
+               }
+               finally {
+                  connectionsBeingCreated.decrementAndGet();
+               }
+
+               if (added) {
                   quietlySleep(30L);
                   break;
                } else {  // failed to get connection from db, sleep and retry

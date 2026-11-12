@@ -28,7 +28,8 @@ public interface HikariConfigMXBean
    /**
     * Get the maximum number of milliseconds that a client will wait for a connection from the pool. If this
     * time is exceeded without a connection becoming available, a SQLException will be thrown from
-    * {@link javax.sql.DataSource#getConnection()}.
+    * {@link javax.sql.DataSource#getConnection()}, unless an optional
+    * {@link #getConnectionCreationWaitTimeout() creation wait} applies.
     *
     * @return the connection timeout in milliseconds
     */
@@ -37,11 +38,29 @@ public interface HikariConfigMXBean
    /**
     * Set the maximum number of milliseconds that a client will wait for a connection from the pool. If this
     * time is exceeded without a connection becoming available, a SQLException will be thrown from
-    * {@link javax.sql.DataSource#getConnection()}.
+    * {@link javax.sql.DataSource#getConnection()}, unless an optional
+    * {@link #getConnectionCreationWaitTimeout() creation wait} applies.
     *
     * @param connectionTimeoutMs the connection timeout in milliseconds
     */
    void setConnectionTimeout(long connectionTimeoutMs);
+
+   /**
+    * Get the additional acquisition time allowed when the normal connection timeout expires
+    * while a connection is being created and the pool is below its maximum size.
+    *
+    * @return the additional wait in milliseconds, or zero to disable it
+    */
+   long getConnectionCreationWaitTimeout();
+
+   /**
+    * Set the additional acquisition time allowed when the normal connection timeout expires
+    * while a connection is being created and the pool is below its maximum size.
+    * The additional budget is granted at most once per acquisition and does not limit JDBC login time.
+    *
+    * @param connectionCreationWaitTimeoutMs the additional wait in milliseconds; zero disables it
+    */
+   void setConnectionCreationWaitTimeout(long connectionCreationWaitTimeoutMs);
 
    /**
     * Get the maximum number of milliseconds that the pool will wait for a connection to be validated as
